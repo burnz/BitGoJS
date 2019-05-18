@@ -3,6 +3,7 @@ const Wallet = require('../wallet');
 import common = require('../../common');
 const config = require('../../config');
 const BigNumber = require('bignumber.js');
+import bitcoinMessage = require('bitcoinjs-message');
 const Util = require('../../util');
 import * as _ from 'lodash';
 import * as Promise from 'bluebird';
@@ -49,6 +50,10 @@ class Eth extends BaseCoin {
 
   getFullName() {
     return 'Ethereum';
+  }
+
+  static get hopTransactionSalt() {
+    return 'bitgoHopAddressRequestSalt';
   }
 
   /**
@@ -805,6 +810,136 @@ class Eth extends BaseCoin {
       return response.body;
     }).call(this).asCallback(callback);
   }
+
+
+  createHopTransactionParams(buildParams, callback) {
+    return co(function *() {
+      const wallet = buildParams.wallet;
+      const recipients = buildParams.recipients;
+      const walletPassphrase = buildParams.walletPassphrase;
+
+      const userKeychain = yield this.keychains().get({ id: wallet._wallet.keys[0] });
+      const userPrv = wallet.getUserPrv({ keychain: userKeychain, walletPassphrase });
+      if (!recipients || !Array.isArray(recipients)) {
+        throw new Error('expecting array of recipients');
+      }
+
+      // Right now we only support 1 recipient
+      if (recipients.length !== 1) {
+        throw new Error('must send to exactly 1 recipient');
+      }
+      const recipientAddress = recipients[0].address;
+      const recipientAmount = recipients[0].amount;
+      const feeEstimateParams = {
+        recipient: recipientAddress,
+        hop: true,
+      };
+      const feeEstimate = yield this.bitgo.estimateFee(feeEstimateParams);
+      const gasLimit = feeEstimate.gasLimitEstimate;
+      const gasPrice = feeEstimate.feeEstimate / gasLimit;
+      const gasPriceMax = gasPrice * 5;
+      // Payment id as address + current datetime so its always unique every time we build one
+      const paymentId = (new Date().toISOString());
+      const hopDigest = Eth.getHopDigest([recipientAddress, recipientAmount, gasPriceMax, gasLimit, paymentId]);
+
+      if (_.isUndefined(userPrv) || !_.isString(userPrv)) {
+        if (!_.isUndefined(userPrv) && !_.isString(userPrv)) {
+          throw new Error(`prv must be a string, got type ${typeof userPrv}`);
+        }
+          throw new Error('missing prv parameter to sign transaction');
+      }
+
+      const userReqSig = Util.ethSignMsgHash(hopDigest, Util.xprvToEthPrivateKey(userPrv));
+
+      return {
+        gasPriceMax,
+        userReqSig,
+        paymentId,
+      }
+    }).call(this).asCallback(callback);
+  }
+
+  validateHopPrebuild(wallet, hopPrebuild, originalParams, callback) {
+    return co(function *() {
+      const {
+        tx,
+        id,
+        signature,
+      } = hopPrebuild;
+
+      const {
+        recipients,
+      } = originalParams;
+
+      // first, validate the HSM signature
+      const bitgoKeychain = yield this.keychains().get({ id: wallet.keyIds()[0] });
+      const feeAddress = Util.xpubToEthAddress(bitgoKeychain.xpub);
+
+      const signingAddress = Util.ecRecoverEthAddress(id, signature);
+      if (signingAddress !== feeAddress) {
+        throw new Error(`Hop txid signature invalid -- signing address: ${signingAddress}, should be ${feeAddress}`);
+      }
+
+      // Then validate that the tx params actually equal the requested params
+      const originalAmount = recipients[0].amount;
+      const originalDestination = recipients[0].address;
+
+      const builtHopTx = new optionalDeps.EthTx(tx);
+      const hopAmount = BigNumber(optionalDeps.ethUtil.bufferToHex(builtHopTx.value)).toFixed(0);
+      const hopDestination = optionalDeps.ethUtil.bufferToHex(builtHopTx.to);
+      if (hopAmount !== originalAmount) {
+        throw new Error(`Hop amount: ${hopAmount} does not equal original amount: ${originalAmount}`);
+      }
+      if (hopDestination !== originalDestination) {
+        throw new Error(`Hop destination: ${hopDestination} does not equal original recipient: ${hopDestination}`);
+      }
+      if (!builtHopTx.verifySignature()) {
+        // We dont want to continue at all in this case, at risk of ETH being stuck on the hop address
+        throw new Error(`Invalid hop transaction signature, txid: ${id}`);
+      }
+      if (optionalDeps.ethUtil.addHexPrefix(builtHopTx.hash().toString('hex')) !== id) {
+        throw new Error(`Signed hop txid does not equal actual txid`);
+      }
+    }).call(this).asCallback(callback);
+  }
+
+
+  static getHopDigest(paramsArr) {
+    return optionalDeps.ethUtil.bufferToHex(optionalDeps.ethAbi.soliditySHA3([Eth.hopTransactionSalt, ...paramsArr].join('$')));
+  }
+
+  /**
+   * Modify prebuild before sending it to the server. Add things like hop transaction params
+   * @param buildParams The whitelisted parameters for this prebuild
+   * @param buildParams.hop True if this should prebuild a hop tx, else false
+   * @param buildParams.recipients The recipients array of this transaction
+   * @param buildParams.wallet The wallet sending this tx
+   * @param buildParams.walletPassphrase the passphrase for this wallet
+   * @param callback
+   */
+  getExtraPrebuildParams(buildParams, callback) {
+    return co(function *() {
+      let extraParams = { };
+      if (!_.isUndefined(buildParams.hop) && !_.isUndefined(buildParams.wallet) &&
+        !_.isUndefined(buildParams.recipients) && !_.isUndefined(buildParams.walletPassphrase)) {
+        extraParams = Object.assign(extraParams, { hopParams: yield this.createHopTransactionParams(buildParams) });
+      }
+      return extraParams;
+    }).call(this).asCallback(callback);
+  }
+
+  /**
+   * Modify prebuild after receiving it from the server. Add things like nlocktime
+   */
+  postProcessPrebuild(params, callback) {
+    return co(function *() {
+      if (!_.isUndefined(params.hopTransaction) && !_.isUndefined(params.wallet) && !_.isUndefined(params.buildParams)) {
+        yield this.validateHopPrebuild(params.wallet, params.hopTransaction, params.buildParams);
+      }
+      return params;
+    }).call(this).asCallback(callback);
+  }
+
 }
 
 /**

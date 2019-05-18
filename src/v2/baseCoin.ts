@@ -354,6 +354,15 @@ class BaseCoin {
   }
 
   /**
+   * Get extra parameters for prebuilding a tx. Add things like hop transaction params
+   */
+  getExtraPrebuildParams(buildParams, callback) {
+    return Promise.method(function() {
+      return { };
+    }).call(this).asCallback(callback);
+  }
+
+  /**
    * Modify prebuild after receiving it from the server. Add things like nlocktime
    */
   postProcessPrebuild(prebuildResponse, callback) {

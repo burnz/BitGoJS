@@ -1047,25 +1047,29 @@ Wallet.prototype.removeUser = function(params, callback) {
  * @param {Boolean} params.instant - Build this transaction to conform with instant sending coin-specific method (if available)
  * @param {{value: String, type: String}} params.memo - Memo to use in transaction (supported by Stellar)
  * @param {String} params.addressType - The type of address to create for change. One of `p2sh`, `p2shP2wsh`, and `p2wsh`. Case-sensitive.
+ * @param {Boolean} params.hop - Build this as an Ethereum hop transaction
+ * @param {String} params.walletPassphrase The passphrase to the wallet user key, to sign commitment data for Ethereum hop transactions
  * @param callback
  * @returns {*}
  */
 Wallet.prototype.prebuildTransaction = function(params, callback) {
   return co(function *() {
-    // Whitelist params to build tx (mostly around unspent selection)
+    // Whitelist params to build tx
     const whitelistedParams = _.pick(params, [
       'recipients', 'numBlocks', 'feeRate', 'maxFeeRate', 'minConfirms', 'enforceMinConfirmsForChange',
       'targetWalletUnspents', 'message', 'minValue', 'maxValue', 'sequenceId', 'lastLedgerSequence',
       'ledgerSequenceDelta', 'gasPrice', 'noSplitChange', 'unspents', 'changeAddress', 'instant', 'memo', 'addressType',
-      'cpfpTxIds', 'cpfpFeeRate', 'maxFee', 'idfVersion', 'idfSignedTimestamp', 'idfUserId', 'strategy'
+      'cpfpTxIds', 'cpfpFeeRate', 'maxFee', 'idfVersion', 'idfSignedTimestamp', 'idfUserId', 'strategy', 'hop'
     ]);
     debug('prebuilding transaction: %O', whitelistedParams);
 
     if (params.reqId) {
       this.bitgo._reqId = params.reqId;
     }
+    const extraParams = yield this.baseCoin.getExtraPrebuildParams(Object.assign(params, { wallet: this }));
+    const buildParams = Object.assign(whitelistedParams, extraParams);
     const buildQuery = this.bitgo.post(this.baseCoin.url('/wallet/' + this.id() + '/tx/build'))
-    .send(whitelistedParams)
+    .send(buildParams)
     .result();
     const blockHeightQuery = this.baseCoin.getLatestBlockHeight ? this.baseCoin.getLatestBlockHeight(params.reqId) : Promise.resolve(undefined);
     const queries = [buildQuery, blockHeightQuery];
@@ -1074,7 +1078,9 @@ Wallet.prototype.prebuildTransaction = function(params, callback) {
     if (!_.isUndefined(blockHeight)) {
       buildResponse.blockHeight = blockHeight;
     }
-    let prebuild = yield this.baseCoin.postProcessPrebuild(buildResponse);
+    let prebuild = yield this.baseCoin.postProcessPrebuild(Object.assign(buildResponse, { wallet: this, buildParams }));
+    delete prebuild.wallet;
+    delete prebuild.buildParams;
     prebuild = _.extend({}, prebuild, { walletId: this.id() });
     debug('final transaction prebuild: %O', prebuild);
     return prebuild;
@@ -1091,18 +1097,33 @@ Wallet.prototype.prebuildTransaction = function(params, callback) {
  * @return {*}
  */
 Wallet.prototype.signTransaction = function(params, callback) {
-  const userKeychain = params.keychain || params.key;
   const txPrebuild = params.txPrebuild;
   if (!txPrebuild || typeof txPrebuild !== 'object') {
     throw new Error('txPrebuild must be an object');
   }
+  const userPrv = this.getUserPrv(params);
+  const self = this;
+  return Promise.try(function() {
+    const signingParams = _.extend({}, params, { txPrebuild: txPrebuild, prv: userPrv });
+    return self.baseCoin.signTransaction(signingParams);
+  })
+  .nodeify(callback);
+};
+
+/**
+ * Get the user private key from either a derivation or an encrypted keychain
+ * @param [params.keychain / params.key] (object) or params.prv (string)
+ * @param params.walletPassphrase (string)
+ */
+Wallet.prototype.getUserPrv = function(params) {
+  const userKeychain = params.keychain || params.key;
   let userPrv = params.prv;
   if (userPrv && typeof userPrv !== 'string') {
     throw new Error('prv must be a string');
   }
   if (userPrv && params.coldDerivationSeed) {
     // the derivation only makes sense when a key already exists
-    const derivation = this.baseCoin.deriveKeyWithSeed({ key: userPrv, seed: params.coldDerivationSeed });
+  const derivation = this.baseCoin.deriveKeyWithSeed({ key: userPrv, seed: params.coldDerivationSeed });
     userPrv = derivation.key;
   } else if (!userPrv) {
     if (!userKeychain || typeof userKeychain !== 'object') {
@@ -1118,13 +1139,7 @@ Wallet.prototype.signTransaction = function(params, callback) {
 
     userPrv = this.bitgo.decrypt({ input: userEncryptedPrv, password: params.walletPassphrase });
   }
-
-  const self = this;
-  return Promise.try(function() {
-    const signingParams = _.extend({}, params, { txPrebuild: txPrebuild, prv: userPrv });
-    return self.baseCoin.signTransaction(signingParams);
-  })
-  .nodeify(callback);
+  return userPrv;
 };
 
 Wallet.prototype.prebuildAndSignTransaction = function(params, callback) {
@@ -1358,7 +1373,7 @@ Wallet.prototype.sendMany = function(params, callback) {
       'message', 'minValue', 'maxValue', 'sequenceId',
       'lastLedgerSequence', 'ledgerSequenceDelta', 'gasPrice',
       'noSplitChange', 'unspents', 'comment', 'otp', 'changeAddress',
-      'instant', 'memo'
+      'instant', 'memo', 'hopTransaction',
     ]);
     const finalTxParams = _.extend({}, halfSignedTransaction, selectParams);
     this.bitgo._reqId = reqId;
